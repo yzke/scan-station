@@ -1,0 +1,34 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Scans, derived images, logs, and local reports
+output/
+data/
+samples/
+documents/
+scan-agent/
+*.jpg
+*.jpeg
+*.png
+*.pdf
+*.log
+*.sqlite*
+*.db
+*.zip
+*.tar*
+
+# Python and local tooling
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+.code-review-graph/
+.playwright/
+.playwright-cli/
+node_modules/
