@@ -42,7 +42,8 @@ async (page) => {
     requests.push({method, path, body});
     if (method === 'GET' && path === '/documents') return respond(route, {documents: records, active_id: activeId});
     if (method === 'GET' && path === '/scanner/status') return respond(route, {state: 'online',
-      message: '本机模拟设备', supported_dpi: [150, 200, 300], duplex_supported: true, supports_page_rescan: true});
+      message: '本机模拟设备', supported_dpi: [150, 200, 300], duplex_supported: true, supports_page_rescan: true,
+      host_reachable: true, heartbeat_fresh: true});
     const image = path.match(/^\/scan\/([^/]+)\/(page|original)\/(\d+)$/);
     if (method === 'GET' && image) {
       const doc = records.find(item => item.id === image[1]);

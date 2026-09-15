@@ -3,9 +3,16 @@
 The Windows agent writes ``scanner-status.json`` beside (not inside) its request
 directory after read-only WIA discovery. A missing or old heartbeat is unknown,
 not proof that the physical scanner is powered off.
+
+Reading that file is itself the liveness check for the scanner computer: a
+successful read proves the computer answered, while the heartbeat timestamp
+proves its agent is still running. Keeping the two apart lets the station tell
+"computer is off" from "computer is up but nobody is listening", which matters
+because a scan request reserves the device until an agent reports a terminal
+status.
 """
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import threading
 import time
@@ -101,6 +108,9 @@ class ScannerMonitor:
         self._thread = None
         self._status = _unknown("正在等待扫描仪状态")
         self._checked_timestamp = None
+        # Wall-clock time of the last read that actually reached the computer.
+        # None means the scanner computer has not answered yet.
+        self._contacted_at = None
 
     def start(self):
         with self._lock:
@@ -131,18 +141,56 @@ class ScannerMonitor:
         except Exception:
             status = _unknown("无法读取扫描仪状态，请检查 Windows 连接")
             checked_timestamp = None
+            contacted_at = None
+        else:
+            contacted_at = self._clock()
         with self._lock:
             self._status = status
             self._checked_timestamp = checked_timestamp
+            self._contacted_at = contacted_at
         return self.snapshot()
 
     def snapshot(self):
         with self._lock:
             result = deepcopy(self._status)
             checked_timestamp = self._checked_timestamp
+            contacted_at = self._contacted_at
+        fresh = False
         if checked_timestamp is not None:
             age = self._clock() - checked_timestamp
-            if age > self._stale_seconds or age < -self._stale_seconds:
-                return _unknown("扫描仪状态已过期，正在等待设备心跳",
-                                result["checked_at"])
+            fresh = -self._stale_seconds <= age <= self._stale_seconds
+            if not fresh:
+                result = _unknown("扫描仪状态已过期，正在等待设备心跳",
+                                  result["checked_at"])
+        # A successful read proves the computer answered; the heartbeat's own
+        # timestamp proves its agent is still alive. Reported separately so a
+        # caller can say which of the two is missing.
+        result["host_reachable"] = contacted_at is not None
+        result["heartbeat_fresh"] = fresh
+        result["contacted_at"] = _iso(contacted_at)
         return result
+
+
+def _iso(timestamp):
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
+
+
+def readiness_problem(snapshot):
+    """Why a scan must not start yet, or None when the device is ready.
+
+    A scan request reserves the physical device until the agent reports a
+    terminal status, so starting one when nothing can consume it locks the
+    station: the page never arrives and the reservation is never released.
+    Requiring both a reachable computer and a live agent keeps that from
+    happening instead of relying on the operator to notice.
+    """
+    if not snapshot.get("host_reachable"):
+        return "无法连接扫描电脑（未开机或网络不通），请开机并确认扫描代理运行后再扫描。"
+    if not snapshot.get("heartbeat_fresh"):
+        return "扫描电脑已连接，但扫描代理没有运行，请在该电脑上启动 run-agent.cmd 后再扫描。"
+    if snapshot.get("state") not in ("online", "scanning"):
+        return snapshot.get("message") or "扫描仪当前不可用，请检查电源与 USB 连接后刷新状态。"
+    return None

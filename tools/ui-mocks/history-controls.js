@@ -21,7 +21,7 @@ async (page) => {
     if (path === '/favicon.ico') return route.fulfill({status: 204});
     requests.push({method: request.method(), path});
     if (path === '/documents') return respond(route, {documents: records, active_id: activeId});
-    if (path === '/scanner/status') return respond(route, {state: 'online', message: '模拟设备', supported_dpi: [150, 200, 300], duplex_supported: true, supports_page_rescan: true});
+    if (path === '/scanner/status') return respond(route, {state: 'online', message: '模拟设备', supported_dpi: [150, 200, 300], duplex_supported: true, supports_page_rescan: true, host_reachable: true, heartbeat_fresh: true});
     if (/\/page\/1$/.test(path)) return route.fulfill({contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="280"><rect width="200" height="280" fill="white"/><text x="15" y="50">History fixture</text></svg>'});
     const match = path.match(/^\/scan\/(history-\d+)\/delete-document$/);
     if (match) {

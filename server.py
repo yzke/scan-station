@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from impacket.smbconnection import SMBConnection
 from configuration import apply_environment_file, configured_port
 from documents import DocumentConflict, DocumentStore, document_name, scan_options, validate_render_mode
+from scanner_status import readiness_problem
 
 apply_environment_file()
 
@@ -68,6 +69,20 @@ def smb_write(connection, path, data):
 def smb_list(connection, path):
     # A failed listing must not be mistaken for an observed empty directory.
     return [entry.get_longname() for entry in connection.listPath("C$", path + "/*")]
+
+
+def smb_delete(connection, path):
+    connection.deleteFile("C$", path)
+
+
+def request_names(batch_id):
+    """Both filenames a batch can occupy in the request directory.
+
+    ``.upload`` exists only while a request is being published; the agent reads
+    ``.json`` alone, so an interrupted publish is invisible to the scanner and
+    must be cleaned up by the host that wrote it.
+    """
+    return (f"{batch_id}.json", f"{batch_id}.upload")
 
 
 def read_scanner_status():
@@ -135,6 +150,91 @@ class ScanCoordinator:
                 if batch["id"] not in self.threads:
                     self._launch(document_id, batch["id"])
 
+    def _withdraw_request(self, batch_id):
+        """Best-effort removal of a queued physical scan request.
+
+        Returns True only when a fresh listing confirms the request files are
+        gone. False means the scanner host could not be reached or the delete
+        did not stick, so the request may still be scanned when the agent next
+        starts; the caller keeps it queued for retry rather than assuming the
+        machine is free.
+        """
+        connection = None
+        try:
+            connection = self.connection_factory()
+            names = request_names(batch_id)
+            for name in names:
+                if name in smb_list(connection, REQ_DIR):
+                    smb_delete(connection, f"{REQ_DIR}/{name}")
+            remaining = smb_list(connection, REQ_DIR)
+            return not any(name in remaining for name in names)
+        except Exception:
+            return False
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def abandon(self, document_id):
+        """Force-end the batch reserving ``document_id``.
+
+        The physical request is withdrawn first so the scanner agent cannot
+        start an abandoned job later, then the reservation is released so the
+        station accepts new work. Already-received pages are kept.
+        """
+        with self.lock:
+            pending = [(d, b) for d, b in self.store.pending_batches() if d == document_id]
+            if not pending:
+                raise ValueError("当前文件没有正在进行的扫描任务")
+            batch_id = pending[0][1]["id"]
+        # Network work happens outside the coordinator lock: a slow or
+        # unreachable scanner host must not block unrelated scan requests.
+        withdrawn = self._withdraw_request(batch_id)
+        with self.lock:
+            still_pending = any(b["id"] == batch_id for _, b in self.store.pending_batches())
+            if not still_pending:
+                # The agent reported a terminal status while we were trying to
+                # withdraw; the real result wins over the operator's cancel.
+                return {"document": self.store.get(document_id), "batch_id": batch_id,
+                        "withdrawn": withdrawn, "already_finished": True}
+            message = ("已强制终止本批扫描，扫描电脑上的请求已撤回。已收到的页面仍然保留。"
+                       if withdrawn else
+                       "已强制终止本批扫描，但暂时无法连接扫描电脑，请求尚未撤回；"
+                       "恢复连接后会自动重试撤回。已收到的页面仍然保留。")
+            document = self.store.abandon_batch(document_id, batch_id, message, withdrawn=withdrawn)
+        return {"document": document, "batch_id": batch_id, "withdrawn": withdrawn,
+                "already_finished": False}
+
+    def sweep_withdrawals(self):
+        """Retry withdrawing requests a force-end could not confirm.
+
+        Returns the batch ids that are now confirmed withdrawn. Runs on the
+        service timer so cancelling while the scanner computer is off still
+        ends with the request removed once that computer comes back.
+        """
+        withdrawn = []
+        for document_id, batch_id in self.store.unwithdrawn_batches():
+            if self._withdraw_request(batch_id):
+                self.store.mark_request_withdrawn(document_id, batch_id)
+                withdrawn.append(batch_id)
+        return withdrawn
+
+    def start_withdrawal_sweeper(self, interval=30.0):
+        def run():
+            while not self.stop.is_set():
+                self.stop.wait(interval)
+                if self.stop.is_set():
+                    return
+                try:
+                    self.sweep_withdrawals()
+                except Exception:
+                    LOG.exception("withdrawal sweep failed")
+        worker = threading.Thread(target=run, name="request-withdrawal", daemon=True)
+        worker.start()
+        return worker
+
     def start(self, *, document_id=None, name=None, dpi=150, duplex=False, auto_name=None,
               render_mode="original"):
         options = scan_options(dpi, duplex)
@@ -188,6 +288,11 @@ class ScanCoordinator:
         try:
             while not self.stop.is_set():
                 try:
+                    # A forced end releases the reservation outside this worker.
+                    # Stop collecting as soon as that happens so an abandoned
+                    # batch cannot keep polling the scanner host forever.
+                    if not self.store.batch(document_id, batch_id)["pending"]:
+                        return
                     if connection is None:
                         connection = self.connection_factory()
                     batch = self.store.batch(document_id, batch_id)
@@ -438,6 +543,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, self.server.store.set_render_mode(document_id, body["render_mode"],
                            updated_at=body["updated_at"]))
                 return
+            if len(parts) == 3 and action == "abandon":
+                if body:
+                    raise ValueError("强制终止本批不接受额外参数")
+                self._json(200, self.server.coordinator.abandon(document_id))
+                return
             if len(parts) == 3 and action == "delete-document":
                 if set(body) != {"updated_at"}:
                     raise ValueError("请提供当前文件的更新时间")
@@ -505,6 +615,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("auto_name 必须是布尔值")
         options = scan_options(body.get("dpi", 150), body.get("duplex", False))
         snapshot = self.server.monitor.snapshot() if self.server.monitor is not None else {}
+        # Refuse before reserving the device. A batch whose scanner computer
+        # never answers is never released, so an operator must not be able to
+        # start one while that computer or its agent is unreachable.
+        problem = readiness_problem(snapshot)
+        if problem is not None:
+            raise ValueError(problem)
         supported = snapshot.get("supported_dpi", [])
         if (supported and options["dpi"] not in supported) or (options["dpi"] != 150 and not supported):
             raise ValueError("尚未确认扫描仪支持该 DPI，请选择已支持的分辨率")
@@ -527,6 +643,9 @@ def main():
     namer.start()
     namer.recover()
     coordinator.recover()
+    # A force-end performed while the scanner computer was unreachable leaves
+    # its request queued for a retry, including across a service restart.
+    coordinator.start_withdrawal_sweeper()
     LOG.info("Scan Station on %s:%s; history: %s", *server.server_address, DATA_ROOT)
     try:
         server.serve_forever()

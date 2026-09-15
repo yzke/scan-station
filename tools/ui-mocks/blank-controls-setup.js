@@ -2,7 +2,7 @@ async (page) => {
   const fixture = {
     documents: [{id:'order-doc',name:'手动归档文件',name_source:'manual',auto_name:false,ocr_state:'done',state:'done',msg:'',pages:[3,1,4,2],page_details:{1:{revision:1,dpi:150},2:{revision:1,dpi:200},3:{revision:2,dpi:300},4:{revision:1,dpi:150}},order_revision:4,rescan_page:null,blank_undo:null,dpi:300,duplex:true,created_at:'2026-09-13T01:00:00Z',updated_at:'2026-09-13T01:00:00Z'}],
     active_id: null,
-    scanner: {state: 'online', message: 'A4 送纸式扫描仪已连接，可以开始扫描', checked_at: '2026-09-13T08:00:00Z', supported_dpi: [150, 200, 300], duplex_supported: true, supports_page_rescan: true},
+    scanner: {state: 'online', message: 'A4 送纸式扫描仪已连接，可以开始扫描', checked_at: '2026-09-13T08:00:00Z', supported_dpi: [150, 200, 300], duplex_supported: true, supports_page_rescan: true, host_reachable: true, heartbeat_fresh: true},
     logs: [], nextId: 1, failNext: null, listDelay: 0, createDelay: 0, ocrAttempts: [],
     candidates:[1,2], analysisErrors:[4], analysisDelay:0, staleAnalysis:false, staleDeleteOnce:false, undoHistory:null, clientErrors:[]
   };

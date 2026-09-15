@@ -2,7 +2,7 @@
 
 (() => {
   const ids = ['deviceBadge', 'deviceLabel', 'deviceMessage', 'deviceCaptureMode', 'btnDeviceRefresh', 'notice',
-    'activeBanner', 'activeMessage', 'btnViewActive', 'fileState', 'fileName', 'nameState', 'nameHelp',
+    'activeBanner', 'activeMessage', 'btnViewActive', 'btnAbandonScan', 'fileState', 'fileName', 'nameState', 'nameHelp',
     'dpi', 'dpiHelp', 'scanMode', 'modeHelp', 'btnScan', 'btnStartScan', 'btnContinue', 'scanActionHelp', 'currentHeading', 'status', 'count',
     'btnPdf', 'grid', 'empty', 'emptyTitle', 'emptyText', 'historyCount', 'history',
     'historyEmpty', 'btnHistoryRefresh', 'historyPager', 'btnHistoryPrev', 'btnHistoryNext', 'historyPageLabel', 'nameDialog', 'nameForm', 'nameDialogTitle',
@@ -280,9 +280,28 @@
     return capabilities !== null && !capabilities.includes(Number(ui.dpi.value));
   }
 
+  function deviceProblem() {
+    // Mirrors scanner_status.readiness_problem. A scan request reserves the
+    // scanner until the agent reports a terminal status, so starting one while
+    // the computer or its agent is unreachable would lock the station. The
+    // server refuses these too; showing it here explains the disabled button.
+    if (!scannerChecked) return '正在确认扫描电脑与扫描仪状态…';
+    if (scanner.host_reachable !== true) {
+      return '无法连接扫描电脑（未开机或网络不通），请开机并确认扫描代理运行后再扫描。';
+    }
+    if (scanner.heartbeat_fresh !== true) {
+      return '扫描电脑已连接，但扫描代理没有运行，请在该电脑上启动 run-agent.cmd 后再扫描。';
+    }
+    if (!['online', 'scanning'].includes(scanner.state)) {
+      return scanner.message || '扫描仪当前不可用，请检查电源与 USB 连接后刷新状态。';
+    }
+    return null;
+  }
+
   function assertCanScan() {
     if (hasActiveScan()) throw new Error('扫描仪正在处理另一批纸张，请等待完成。');
-    if (scanner.state === 'offline') throw new Error('扫描仪未连接，请检查电源与连接后刷新状态。');
+    const problem = deviceProblem();
+    if (problem) throw new Error(problem);
     if (settingsUnavailable()) throw new Error('尚未检测到可用清晰度，请刷新扫描仪状态。');
   }
 
@@ -291,7 +310,9 @@
     const labels = {online: '扫描仪已连接', offline: '扫描仪未连接', unknown: '连接状态未知', scanning: '扫描仪工作中'};
     ui.deviceBadge.className = 'badge ' + (labels[state] ? state : 'unknown');
     ui.deviceLabel.textContent = labels[state] || labels.unknown;
-    ui.deviceMessage.textContent = state === 'scanning' ? '正在处理送纸器中的纸张，请等待本批扫描完成' : scanner.message || (
+    const blocked = activeId ? null : deviceProblem();
+    ui.deviceMessage.textContent = state === 'scanning' ? '正在处理送纸器中的纸张，请等待本批扫描完成' :
+      blocked || scanner.message || (
       state === 'online' ? '可以开始扫描' : state === 'offline' ? '请检查扫描仪电源与连接' :
       state === 'scanning' ? '正在处理送纸器中的纸张' : '暂时无法确认连接状态，可稍后刷新');
     const captureModes = {'wia2-batch': '连续进纸', 'wia-automation-compat': '逐页兼容模式',
@@ -312,6 +333,10 @@
     ui.activeBanner.hidden = !hasActiveScan();
     ui.btnViewActive.hidden = !doc || selectedId === activeId;
     ui.btnViewActive.disabled = busy;
+    // The forced end is the only way out of a batch whose scanner never reports
+    // a terminal status, so it stays reachable whenever the station is reserved.
+    ui.btnAbandonScan.hidden = !activeId;
+    ui.btnAbandonScan.disabled = busy;
     if (doc) {
       const rescanIndex = doc.pages.indexOf(doc.rescan_page);
       ui.activeMessage.textContent = rescanIndex >= 0 ? '「' + displayName(doc) + '」正在重扫第 ' + (rescanIndex + 1) + ' 页 · 原页保留' : '「' + displayName(doc) + '」' +
@@ -350,11 +375,13 @@
     const scanning = !!doc && (doc.id === activeId || state === 'scanning');
     ui.fileState.className = 'file-state ' + (scanning ? 'scanning' : state);
     ui.fileState.textContent = scanning ? (state === 'error' ? '等待任务结束' : '正在扫描') :
-      state === 'done' ? '已保存' : state === 'error' ? '扫描未完成' : '准备扫描';
+      state === 'done' ? '已保存' : state === 'error' ? '扫描未完成' :
+      state === 'cancelled' ? '已终止' : '准备扫描';
     let message = !listLoaded ? '正在读取文件记录…' :
       !doc ? (creatingDocument ? '正在创建文件并开始扫描…' : '确认文件名称、清晰度和单双面，放好纸张后点击「开始扫描」。') :
       scanning ? '已收到 ' + doc.pages.length + ' 页，新页面将继续显示在下方。' :
       state === 'error' ? '扫描未完成：' + (doc.msg || '请检查纸张与扫描仪连接后重试。') :
+      state === 'cancelled' ? (doc.msg || '本批扫描已强制终止。') :
       '已保存 ' + doc.pages.length + ' 页，可继续扫描追加页面，或下载 PDF。';
     if (doc?.state === 'error' && scanning) message = (doc.msg || '扫描任务尚未结束。') + ' 已收到的页面仍会保留，请等待扫描仪结束任务。';
     if (scanning && Number.isInteger(doc.rescan_page)) {
@@ -715,7 +742,8 @@
       node.title.textContent = displayName(doc);
       node.title.title = displayName(doc);
       node.detail.textContent = shortDate(doc.created_at) + ' · ' + doc.pages.length + ' 页';
-      node.state.textContent = scanning ? '扫描中' : doc.state === 'error' ? '未完成' : doc.id === selectedId ? '当前文件' : '已保存';
+      node.state.textContent = scanning ? '扫描中' : doc.state === 'error' ? '未完成' :
+        doc.state === 'cancelled' ? '已终止' : doc.id === selectedId ? '当前文件' : '已保存';
       node.state.className = 'history-state ' + (scanning ? 'scanning' : doc.state || '');
       node.buttons.forEach(button => { button.disabled = busy; });
       node.buttons[2].disabled = busy || !doc.pages.length;
@@ -758,15 +786,17 @@
     renderSelected();
     renderHistory();
     const preparing = !documents.has(selectedId);
-    const lockScan = busy || !listLoaded || hasActiveScan() || scanner.state === 'offline' || settingsUnavailable();
+    const deviceBlocked = !!deviceProblem();
+    const lockScan = busy || !listLoaded || hasActiveScan() || deviceBlocked || settingsUnavailable();
     ui.currentHeading.textContent = preparing ? '新文件设置' : '当前文件';
     ui.btnScan.hidden = preparing;
-    ui.btnScan.disabled = busy || !listLoaded || hasActiveScan();
+    ui.btnScan.disabled = busy || !listLoaded || hasActiveScan() || deviceBlocked;
     ui.btnStartScan.hidden = !preparing;
     ui.btnStartScan.disabled = lockScan || !preparing;
     ui.btnContinue.hidden = preparing;
     ui.btnContinue.disabled = lockScan || !documents.has(selectedId);
-    ui.scanActionHelp.textContent = preparing ? '确认设置后，点击开始扫描' : '继续扫描会追加到当前文件';
+    ui.scanActionHelp.textContent = deviceBlocked ? deviceProblem() :
+      preparing ? '确认设置后，点击开始扫描' : '继续扫描会追加到当前文件';
     ui.btnPdf.disabled = busy || !documents.get(selectedId)?.pages.length;
     ui.fileName.disabled = busy || !listLoaded;
     ui.dpi.disabled = busy || hasActiveScan() || !reportedDpi() || settingsUnavailable();
@@ -1184,6 +1214,25 @@
   ui.btnRescanCancel.addEventListener('click', () => { if (!busy) ui.rescanDialog.close(); });
   ui.rescanDialog.addEventListener('cancel', event => { if (busy) event.preventDefault(); });
   ui.btnViewActive.addEventListener('click', () => { if (activeId) void openDocument(activeId); });
+
+  async function abandonActiveBatch() {
+    if (busy || !activeId) return;
+    const doc = documents.get(activeId);
+    await runAction(async () => {
+      if (!window.confirm('强制终止「' + (doc ? displayName(doc) : '当前扫描') + '」？\n' +
+          '本批扫描会立即结束，已收到的页面保留。扫描电脑上的请求会一并撤回；' +
+          '如果当前无法连接扫描电脑，会在恢复连接后自动重试撤回。')) return;
+      const result = await mutate(pathFor(activeId, 'abandon'));
+      if (result && result.document) putDocument(result.document);
+      activeId = null;
+      notify(result && result.withdrawn === false
+        ? '已强制终止本批扫描。扫描电脑当前不可达，请求将在恢复连接后自动撤回。'
+        : '已强制终止本批扫描，扫描电脑上的请求已撤回。');
+      schedulePoll(200);
+    });
+  }
+
+  ui.btnAbandonScan.addEventListener('click', () => { void abandonActiveBatch(); });
   ui.btnDeviceRefresh.addEventListener('click', () => { void refreshScanner(); });
   ui.btnHistoryRefresh.addEventListener('click', () => { void refreshDocuments(); });
   ui.btnHistoryPrev.addEventListener('click', () => { if (!busy) { historyPage--; renderHistory(); } });

@@ -14,7 +14,8 @@ from server import ScanCoordinator, ScanHTTPServer
 class FakeMonitor:
     def __init__(self):
         self.status = {"state": "online", "message": "测试设备在线", "checked_at": "2026-09-13T00:00:00Z",
-                       "supported_dpi": [150, 200, 300], "duplex_supported": True}
+                       "supported_dpi": [150, 200, 300], "duplex_supported": True,
+                       "host_reachable": True, "heartbeat_fresh": True}
 
     def snapshot(self):
         return dict(self.status)
@@ -110,11 +111,51 @@ def test_malformed_json_and_unknown_document_are_safe(api):
 
 def test_options_require_device_capability_for_new_features(api):
     request, store, _, monitor = api
-    monitor.status = {"state": "unknown", "supported_dpi": []}
+    # An unconfirmed device cannot start a scan at all: the request would
+    # reserve a scanner that nothing is listening for, and that reservation is
+    # only released by a terminal status the agent will never send.
+    monitor.status = {"state": "unknown", "message": "暂时无法确认扫描仪状态",
+                      "checked_at": None, "supported_dpi": [],
+                      "host_reachable": False, "heartbeat_fresh": False}
     assert request("POST", "/scan", {"dpi": 300})[0] == 400
     assert request("POST", "/scan", {"duplex": True})[0] == 400
+    assert request("POST", "/scan", {"dpi": 150, "duplex": False})[0] == 400
     assert store.list() == []
+
+    # A confirmed device that reports only 150 DPI single-sided still refuses
+    # capabilities it has not confirmed.
+    monitor.status = {"state": "online", "message": "扫描仪已连接",
+                      "checked_at": "2026-09-13T00:00:00Z", "supported_dpi": [150],
+                      "duplex_supported": False,
+                      "host_reachable": True, "heartbeat_fresh": True}
+    assert request("POST", "/scan", {"dpi": 300})[0] == 400
+    assert request("POST", "/scan", {"duplex": True})[0] == 400
     assert request("POST", "/scan", {"dpi": 150, "duplex": False})[0] == 202
+
+
+def test_scan_is_refused_while_the_scanner_computer_is_offline(api):
+    request, store, _, monitor = api
+    monitor.status = {"state": "unknown", "message": "无法读取扫描仪状态，请检查 Windows 连接",
+                      "checked_at": None, "supported_dpi": [],
+                      "host_reachable": False, "heartbeat_fresh": False}
+
+    status, _, error = request("POST", "/scan", {"name": "关机时不应开扫", "dpi": 150})
+    assert status == 400 and "无法连接扫描电脑" in error["error"]
+    # No reservation was created, so the station is still free.
+    assert store.list() == [] and store.pending_batches() == []
+    assert request("GET", "/documents")[2]["active_id"] is None
+
+
+def test_scan_is_refused_while_the_agent_is_not_running(api):
+    request, store, _, monitor = api
+    monitor.status = {"state": "unknown", "message": "扫描仪状态已过期，正在等待设备心跳",
+                      "checked_at": "2026-09-13T00:00:00Z", "supported_dpi": [],
+                      "host_reachable": True, "heartbeat_fresh": False}
+
+    status, _, error = request("POST", "/scan", {"name": "代理未运行时不应开扫", "dpi": 150})
+    # The computer answered but nothing is listening, which needs its own fix.
+    assert status == 400 and "run-agent.cmd" in error["error"]
+    assert store.pending_batches() == []
 
 
 def test_scanner_status_is_cached_and_shows_scan_activity(api):
@@ -450,3 +491,38 @@ def test_real_blank_classifier_http_mark_select_delete_undo_and_pdf_order(api):
     for number, data in originals.items():
         assert request("GET", f"/scan/{sid}/original/{number}")[2] == data
     assert scanner.active_id is None
+
+
+def test_forced_end_releases_the_station_for_new_work(api):
+    request, store, scanner, _ = api
+    status, _, created = request("POST", "/scan", {"name": "强制终止接口样例", "dpi": 150})
+    assert status == 202
+    sid = created["id"]
+    assert request("GET", "/documents")[2]["active_id"] == sid
+
+    status, _, result = request("POST", f"/scan/{sid}/abandon")
+    assert status == 200
+    assert result["already_finished"] is False
+    # This fixture forbids real SMB, so the withdrawal cannot be confirmed.
+    assert result["withdrawn"] is False
+    assert result["document"]["state"] == "cancelled"
+
+    # The reservation is gone, so the station accepts new work again.
+    assert request("GET", "/documents")[2]["active_id"] is None
+    assert scanner.active_id is None
+    assert request("POST", "/scan", {"name": "终止后新批次", "dpi": 150})[0] == 202
+
+
+def test_forced_end_rejects_a_document_with_no_batch(api):
+    request, _, _, _ = api
+    created = request("POST", "/scan", {"name": "无批次样例", "dpi": 150})[2]
+    assert request("POST", f"/scan/{created['id']}/abandon")[0] == 200
+    status, _, error = request("POST", f"/scan/{created['id']}/abandon")
+    assert status == 400 and "没有正在进行的扫描任务" in error["error"]
+
+
+def test_forced_end_rejects_extra_parameters(api):
+    request, _, _, _ = api
+    created = request("POST", "/scan", {"name": "多余参数样例", "dpi": 150})[2]
+    status, _, error = request("POST", f"/scan/{created['id']}/abandon", {"force": True})
+    assert status == 400 and "不接受额外参数" in error["error"]

@@ -573,6 +573,45 @@ class DocumentStore:
                 document.update(state="error", msg=message)
                 self._save(document)
 
+    def abandon_batch(self, document_id, batch_id, message, *, withdrawn):
+        """Release a reserved device when an operator forces a batch to end.
+
+        The batch stops being pending so the station accepts new work again.
+        No terminal status is invented: the document records that a person
+        ended the batch, and pages already published stay untouched.
+        ``withdrawn`` records whether the physical request was confirmed gone
+        from the scanner host, so an unreachable host leaves retryable work
+        behind instead of a request that scans by surprise later.
+        """
+        with self.lock:
+            document = self._document(document_id)
+            batch = self._batch(document, batch_id)
+            if not batch["pending"]:
+                return self._public(document)
+            batch.update(pending=False, state="cancelled", cancelled_at=timestamp(),
+                         request_withdrawn=bool(withdrawn))
+            document.update(state="cancelled", msg=message)
+            self._save(document)
+            return self._public(document)
+
+    def unwithdrawn_batches(self):
+        """Cancelled batches whose physical request may still be queued."""
+        with self.lock:
+            return [(d["id"], b["id"]) for d in self._documents.values()
+                    if not d.get("deleted_at")
+                    for b in d["batches"]
+                    if b.get("cancelled_at") and not b.get("request_withdrawn")]
+
+    def mark_request_withdrawn(self, document_id, batch_id):
+        with self.lock:
+            document = self._document(document_id)
+            batch = self._batch(document, batch_id)
+            if batch.get("request_withdrawn"):
+                return False
+            batch["request_withdrawn"] = True
+            self._save(document)
+            return True
+
     def received(self, document_id, batch_id, source_page):
         with self.lock:
             document = self._document(document_id)
@@ -616,10 +655,19 @@ class DocumentStore:
                                                      if not document["page_details"][str(n)].get("deleted")))
                 self._save(document)
             directory = self.directory(document_id)
-            atomic_write(directory / "raw" / f"p{number}.jpg", data)
-            processed, crop = self.processor(data)
-            width, height = complete_jpeg(processed)
-            atomic_write(directory / f"p{number}.jpg", processed)
+        # Decoding, paper-edge detection and both JPEG writes are the expensive
+        # part of receiving a page. They run outside the store lock so a page in
+        # progress cannot stall unrelated API reads (document lists, page
+        # status) for the duration of the whole page.
+        atomic_write(directory / "raw" / f"p{number}.jpg", data)
+        processed, crop = self.processor(data)
+        width, height = complete_jpeg(processed)
+        atomic_write(directory / f"p{number}.jpg", processed)
+        with self.lock:
+            document = self._document(document_id)
+            page = document["page_details"][str(number)]
+            if page.get("ready") or page.get("deleted"):
+                return number
             page.update(ready=True, crop=crop, width=width, height=height)
             document["order_revision"] += 1
             document.update(state="scanning", msg="正在扫描，已收到的页面已保存")

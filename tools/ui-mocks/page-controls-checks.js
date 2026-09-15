@@ -5,7 +5,7 @@ async (page) => {
   const mock = change => page.evaluate(async value => (await fetch('/__mock__', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(value)})).json(), change);
   const order = () => page.locator('#grid .pg').evaluateAll(nodes => nodes.map(node => Number(node.dataset.page)));
   const waitOrder = values => page.waitForFunction(values => JSON.stringify([...document.querySelectorAll('#grid .pg')].map(node => Number(node.dataset.page))) === JSON.stringify(values), values);
-  const online = {state:'online',message:'扫描仪已连接',supported_dpi:[150,200,300],duplex_supported:true,supports_page_rescan:true};
+  const online = {state:'online',message:'扫描仪已连接',supported_dpi:[150,200,300],duplex_supported:true,supports_page_rescan:true,host_reachable:true,heartbeat_fresh:true};
   const refresh = async () => { await page.locator('#btnHistoryRefresh').click(); };
   const finish = async doc => {
     await mock({document:doc,active_id:null,scanner:online});

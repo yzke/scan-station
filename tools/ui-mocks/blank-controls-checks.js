@@ -102,11 +102,11 @@ async (page) => {
   assert((await selected()).length===0,'Conflict retained the obsolete selection');
   results.push('Late/stale analysis is discarded; full-snapshot delete conflict clears marks and refreshes without dropping pages');
 
-  const online={state:'online',message:'扫描仪已连接',supported_dpi:[150,200,300],duplex_supported:true,supports_page_rescan:true};
+  const online={state:'online',message:'扫描仪已连接',supported_dpi:[150,200,300],duplex_supported:true,supports_page_rescan:true,host_reachable:true,heartbeat_fresh:true};
   await change({scanner:{...online,state:'scanning'},active_id:'order-doc',document:{id:'order-doc',state:'scanning'}});
   await page.locator('#btnDeviceRefresh').click();await refresh();
   assert(await page.locator('#btnMarkBlank').isDisabled() && await pick(3).isDisabled(),'Active scan did not lock cleanup controls');
-  await change({scanner:{state:'offline',message:'扫描仪未连接'},active_id:null,document:{id:'order-doc',state:'done'}});
+  await change({scanner:{state:'offline',message:'扫描仪未连接',host_reachable:true,heartbeat_fresh:true},active_id:null,document:{id:'order-doc',state:'done'}});
   await page.locator('#btnDeviceRefresh').click();await refresh();
   await pick(3).check();await page.locator('#btnDeleteSelected').click();await idle();
   assert(!(await order()).includes(3),'Offline scanner prevented history cleanup');
